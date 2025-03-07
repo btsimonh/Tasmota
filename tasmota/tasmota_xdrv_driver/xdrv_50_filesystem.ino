@@ -1023,9 +1023,13 @@ void UFSRename(void) {
 * by default, it also enables cors on the webserver - this allows you to have 
 * a website external to TAS which can access the files, else the browser refuses.
 */
-#include "detail/RequestHandlersImpl.h"
+
 
 //#define SERVING_DEBUG
+
+//#define ORIGINAL_CODE_HERE
+#ifdef ORIGINAL_CODE_HERE
+#include "detail/RequestHandlerImpl.h"
 
 // class to allow us to request auth when required.
 // StaticRequestHandler is in the above header
@@ -1136,6 +1140,239 @@ public:
         return true;
     }
 };
+#endif
+
+
+#include "detail/RequestHandler.h"
+#include "detail/mimetable.h"
+//#include "WString.h"
+#include "Uri.h"
+#include <MD5Builder.h>
+#include <base64.h>
+
+using namespace mime;
+
+
+class StaticRequestHandlerAuth : public RequestHandler {
+public:
+  StaticRequestHandlerAuth(FS &fs, const char *path, const char *uri, const char *cache_header, bool requireAuth) : _fs(fs), _uri(uri), _path(path), _cache_header(cache_header) {
+    File f = fs.open(path);
+    _isFile = (f && (!f.isDirectory()));
+#ifdef SERVING_DEBUG
+    AddLog(LOG_LEVEL_DEBUG, PSTR("UFS: StaticRequestHandlerAuth: path=%s uri=%s isFile=%d, cache_header=%s"), path, uri, _isFile, cache_header ? cache_header : "");
+#endif
+    _baseUriLength = _uri.length();
+    _requireAuth = requireAuth;
+  }
+
+  bool _requireAuth;
+
+  bool canHandle(HTTPMethod requestMethod, const String &requestUri) override {
+    if (requestMethod != HTTP_GET) {
+      return false;
+    }
+
+    if ((_isFile && requestUri != _uri) || !requestUri.startsWith(_uri)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  bool canHandle(WebServer &server, HTTPMethod requestMethod, const String &requestUri) override {
+    if (requestMethod != HTTP_GET) {
+      return false;
+    }
+
+    if ((_isFile && requestUri != _uri) || !requestUri.startsWith(_uri)) {
+      return false;
+    }
+
+    if (_filter != NULL ? _filter(server) == false : false) {
+      return false;
+    }
+
+    return true;
+  }
+
+  bool handle(WebServer &server, HTTPMethod requestMethod, const String &requestUri) override {
+    if (!canHandle(server, requestMethod, requestUri)) {
+      return false;
+    }
+
+#ifdef SERVING_DEBUG
+    AddLog(LOG_LEVEL_DEBUG, PSTR("UFS: ::handle: request=%s _uri=%s"), requestUri.c_str(), _uri.c_str());
+#endif
+
+    String path(_path);
+
+    if (!_isFile) {
+      // Base URI doesn't point to a file.
+      // If a directory is requested, look for index file.
+      if (requestUri.endsWith("/")) {
+        return handle(server, requestMethod, String(requestUri + "index.htm"));
+      }
+
+      // Append whatever follows this URI in request to get the file path.
+      path += requestUri.substring(_baseUriLength);
+    }
+#ifdef SERVING_DEBUG
+    AddLog(LOG_LEVEL_DEBUG, PSTR("UFS: ::handle: path=%s, isFile=%d"), path.c_str(), _isFile);
+#endif
+
+    String contentType = getContentType(path);
+
+    // look for gz file, only if the original specified path is not a gz.  So part only works to send gzip via content encoding when a non compressed is asked for
+    // if you point the the path to gzip you will serve the gzip as content type "application/x-gzip", not text or javascript etc...
+    if (!path.endsWith(FPSTR(mimeTable[gz].endsWith)) && !_fs.exists(path)) {
+      String pathWithGz = path + FPSTR(mimeTable[gz].endsWith);
+      if (_fs.exists(pathWithGz)) {
+        path += FPSTR(mimeTable[gz].endsWith);
+      }
+    }
+
+    File f = _fs.open(path, "r");
+    if (!f || !f.available()) {
+      AddLog(LOG_LEVEL_DEBUG, PSTR("UFS: ::handler missing file?"));
+      return false;
+    }
+
+
+    if (_requireAuth && !WebAuthenticate()) {
+      f.close();
+#ifdef SERVING_DEBUG
+      AddLog(LOG_LEVEL_ERROR, PSTR("UFS: serv of %s denied"), requestUri.c_str());
+#endif          
+      server.requestAuthentication();
+      return true;
+    }
+
+    String eTagCode;
+
+    if (server._eTagEnabled) {
+      if (server._eTagFunction) {
+        eTagCode = (server._eTagFunction)(_fs, path);
+      } else {
+        eTagCode = calcETag(_fs, path);
+      }
+
+      if (server.header("If-None-Match") == eTagCode) {
+        server.send(304);
+        return true;
+      }
+    }
+
+    if (_cache_header.length() != 0) {
+      server.sendHeader("Cache-Control", _cache_header);
+    }
+
+    if ((server._eTagEnabled) && (eTagCode.length() > 0)) {
+      server.sendHeader("ETag", eTagCode);
+    }
+
+#ifdef UFSSERVE_STREAM_FILE
+#ifdef SERVING_DEBUG
+    AddLog(LOG_LEVEL_DEBUG, PSTR("UFS: ::handler streaming"));
+#endif
+    server.streamFile(f, contentType);
+    return true;
+#else
+#ifdef SERVING_DEBUG
+    AddLog(LOG_LEVEL_DEBUG, PSTR("UFS: ::handler sending"));
+#endif
+    uint8_t buff[512];
+    uint32_t bread;
+    uint32_t flen = f.available();
+    WiFiClient download_Client = server.client();
+    server.setContentLength(flen);   
+    server.send(200, contentType, "");
+
+    // transfer is about 150kb/s
+    uint32_t cnt = 0;
+    while (f.available()) {
+      bread = f.read(buff, sizeof(buff));
+      cnt += bread;
+#ifdef SERVING_DEBUG
+      //AddLog(LOG_LEVEL_DEBUG, PSTR("UFS: ::handler sending %d/%d"), cnt, flen);
+#endif          
+      uint32_t bw = download_Client.write((const char*)buff, bread);
+      if (!bw) { break; }
+      yield();
+    }
+#ifdef SERVING_DEBUG
+    AddLog(LOG_LEVEL_DEBUG, PSTR("UFS: ::handler sent %d/%d"), cnt, flen);
+#endif
+
+    if (cnt != flen){
+      AddLog(LOG_LEVEL_ERROR, PSTR("UFS: ::handler incomplete file send: sent %d/%d"), cnt, flen);
+    }
+
+    // It does seem that on lesser ESP32, this causes a problem?  A lockup...
+    //server.streamFile(f, contentType);
+
+    f.close();
+    download_Client.stop();
+
+#ifdef SERVING_DEBUG
+    AddLog(LOG_LEVEL_DEBUG, PSTR("UFS: ::handler done"));
+#endif        
+    return true;
+#endif
+  }
+
+  static String getContentType(const String &path) {
+    char buff[sizeof(mimeTable[0].mimeType)];
+    // Check all entries but last one for match, return if found
+    for (size_t i = 0; i < sizeof(mimeTable) / sizeof(mimeTable[0]) - 1; i++) {
+      strcpy_P(buff, mimeTable[i].endsWith);
+      if (path.endsWith(buff)) {
+        strcpy_P(buff, mimeTable[i].mimeType);
+        return String(buff);
+      }
+    }
+    // Fall-through and just return default type
+    strcpy_P(buff, mimeTable[sizeof(mimeTable) / sizeof(mimeTable[0]) - 1].mimeType);
+    return String(buff);
+  }
+
+  // calculate an ETag for a file in filesystem based on md5 checksum
+  // that can be used in the http headers - include quotes.
+  static String calcETag(FS &fs, const String &path) {
+    String result;
+
+    // calculate eTag using md5 checksum
+    uint8_t md5_buf[16];
+    File f = fs.open(path, "r");
+    MD5Builder calcMD5;
+    calcMD5.begin();
+    calcMD5.addStream(f, f.size());
+    calcMD5.calculate();
+    calcMD5.getBytes(md5_buf);
+    f.close();
+    // create a minimal-length eTag using base64 byte[]->text encoding.
+    result = "\"" + base64::encode(md5_buf, 16) + "\"";
+    return (result);
+  }  // calcETag
+
+  StaticRequestHandlerAuth &setFilter(WebServer::FilterFunction filter) {
+    _filter = filter;
+    return *this;
+  }
+
+protected:
+  // _filter should return 'true' when the request should be handled
+  // and 'false' when the request should be ignored
+  WebServer::FilterFunction _filter;
+  FS _fs;
+  String _uri;
+  String _path;
+  String _cache_header;
+  bool _isFile;
+  size_t _baseUriLength;
+};
+
+
+
 
 void UFSServe(void) {
   bool result = false;
